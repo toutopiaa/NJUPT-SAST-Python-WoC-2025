@@ -1,0 +1,259 @@
+import os
+import torch
+from torch.utils.data import Dataset, DataLoader
+from torch import nn, optim
+import numpy as np
+import h5py
+import glob
+import re
+
+# ------------------------------------适配单通道Raw数据的DnCNN去噪模型 --------------------------
+class DnCNN(nn.Module):
+    def __init__(self, channels=1, num_of_layers=17):
+        super(DnCNN, self).__init__()
+        kernel_size = 3
+        padding = 1
+        features = 64
+        layers = []
+        # 输入卷积层
+        layers.append(nn.Conv2d(channels, features, kernel_size, padding=padding, bias=False))
+        layers.append(nn.ReLU(inplace=True))
+        # 中间隐藏层
+        for _ in range(num_of_layers - 2):
+            layers.append(nn.Conv2d(features, features, kernel_size, padding=padding, bias=False))
+            layers.append(nn.BatchNorm2d(features))
+            layers.append(nn.ReLU(inplace=True))
+        # 输出卷积层
+        layers.append(nn.Conv2d(features, channels, kernel_size, padding=padding, bias=False))
+        self.dncnn = nn.Sequential(*layers)
+
+    def forward(self, x):
+        residual = self.dncnn(x)
+        return x - residual  # 残差学习
+
+# -------------------------- 内存预加载版Dataset（彻底消除IO瓶颈，适配num_workers=0） --------------------------
+class SIDD_Raw_Dataset_Preloaded(Dataset):
+    def __init__(self, root_dir, patch_size=128):
+        self.root_dir = root_dir
+        self.patch_size = patch_size
+        # 1.路径合法性校验
+        if not os.path.exists(root_dir):
+            raise FileNotFoundError(f"Data文件夹不存在！请检查路径：{root_dir}")
+        
+        # 2.按照Scene_Instances.txt遍历场景文件夹
+        scene_instances_path = os.path.join(os.path.dirname(root_dir), "Scene_Instances.txt")
+        if not os.path.exists(scene_instances_path):
+            raise FileNotFoundError(f"Scene_Instances.txt不存在！请检查是否和Data文件夹在同一级目录")
+      #更改——————————————————————————————————————————————————
+        scene_dirs = []
+	# 打开Scene_Instances.txt文件，按行读取
+	for line in open(scene_instances_path, 'r'):
+	    # 去除每行首尾的空白（包括换行符\n、空格、制表符\t等）
+	    cleaned_line = line.strip()
+	    # 过滤空行：如果清洗后不是空字符串，才加入列表
+	    if cleaned_line:
+	        scene_dirs.append(cleaned_line)
+        valid_scene_dirs = []
+	for d in scene_dirs:
+    	# 拼接完整路径：Data目录 + 场景名称（比如D:\SIDD_Medium_Raw\Data\Scene_001）
+    	scene_full_path = os.path.join(root_dir, d)
+    	# 判断这个路径是不是真实存在的文件夹
+    	if os.path.isdir(scene_full_path):
+        	valid_scene_dirs.append(d)
+	scene_dirs = valid_scene_dirs
+        print(f"成功匹配Scene_Instances.txt的有效场景文件夹总数：{len(scene_dirs)} 个")
+        #——————————————————————-————————
+        self.noisy_paths = []
+        self.clean_paths = []
+        
+        # 3.配对图像（NOISY_RAW_010 对应 GT_RAW_010）
+        for scene in scene_dirs:
+            scene_path = os.path.join(root_dir, scene)
+            all_noisy_files = sorted(glob.glob(os.path.join(scene_path, "*NOISY_RAW*.MAT")))
+            all_gt_files = sorted(glob.glob(os.path.join(scene_path, "*GT_RAW*.MAT")))
+            
+            if len(all_noisy_files) == 2 and len(all_gt_files) == 2:
+                self.noisy_paths.extend(all_noisy_files)
+                self.clean_paths.extend(all_gt_files)
+            else:
+                print(f"场景 {scene} 下文件数量不匹配，跳过")
+        
+
+#——————————报错是ai加的
+        print(f"成功配对的噪声-真值图像对总数：{len(self.noisy_paths)} 对")
+        if len(self.noisy_paths) == 0:
+            raise ValueError(
+                "未匹配到任何有效图像对！请检查：\n"
+                "1. 路径是否指向Data文件夹（而非SIDD_Medium_Raw根目录）\n"
+                "2. Scene_Instances.txt是否和Data文件夹在同一级目录\n"
+                "3. 场景文件夹内的文件命名是否符合 *NOISY_RAW*.MAT / *GT_RAW*.MAT 格式"
+            )
+        
+        # -------------------------- 核心：一次性预加载所有数据到内存 --------------------------
+        print("正在预加载所有数据到内存")
+        self.noisy_data_list = []
+        self.clean_data_list = []
+        key = 'x'
+        
+        for idx, (noisy_path, clean_path) in enumerate(zip(self.noisy_paths, self.clean_paths)):
+            try:
+                with h5py.File(noisy_path, 'r') as f:
+                    noisy_img = np.array(f[key], dtype=np.float32)
+                with h5py.File(clean_path, 'r') as f:
+                    clean_img = np.array(f[key], dtype=np.float32)
+                
+                # 提前转置维度（MATLAB列优先→Python行优先
+                noisy_img = np.transpose(noisy_img)
+                clean_img = np.transpose(clean_img)
+                
+                self.noisy_data_list.append(noisy_img)
+                self.clean_data_list.append(clean_img)
+                
+                # 每加载20对打印一次进度
+                if (idx + 1) % 20 == 0:
+                    print(f"已预加载 {idx+1}/{len(self.noisy_paths)} 对图像")
+            except Exception as e:
+                print(f"预加载文件失败 {noisy_path}，错误：{e}")
+                continue
+        
+        print(f"数据预加载完成！成功加载 {len(self.noisy_data_list)} 对图像")
+        # -------------------------------------------------------------------------------------
+
+    def __len__(self):
+        return len(self.noisy_data_list)
+
+    def __getitem__(self, idx):
+        # 直接从内存读取数据，无任何IO开销
+        noisy_img = self.noisy_data_list[idx]
+        clean_img = self.clean_data_list[idx]
+#———————顺序变了，改成了先填充再裁剪（貌似这才是正确做法）——————————————        
+        # 同步随机裁剪，统一尺寸
+        h, w = noisy_img.shape
+        patch_size = self.patch_size
+        
+        # 鲁棒性处理：如果图像尺寸小于patch_size，先做零填充
+        if h < patch_size or w < patch_size:
+            pad_h = max(patch_size - h, 0)
+            pad_w = max(patch_size - w, 0)
+            noisy_img = np.pad(noisy_img, ((0, pad_h), (0, pad_w)), mode='constant')
+            clean_img = np.pad(clean_img, ((0, pad_h), (0, pad_w)), mode='constant')
+            h, w = noisy_img.shape
+        
+        # 生成随机裁剪的起始坐标（噪声图和真值图完全同步，保证像素对齐）
+        start_h = np.random.randint(0, h - patch_size + 1)
+        start_w = np.random.randint(0, w - patch_size + 1)
+        
+        # 同步裁剪
+        noisy_patch = noisy_img[start_h:start_h+patch_size, start_w:start_w+patch_size]
+        clean_patch = clean_img[start_h:start_h+patch_size, start_w:start_w+patch_size]
+        
+        # 增加通道维度：从(H,W)转为(1,H,W)，适配PyTorch的CHW张量格式
+        noisy_patch = np.expand_dims(noisy_patch, axis=0)
+        clean_patch = np.expand_dims(clean_patch, axis=0)
+        
+        # 转为PyTorch浮点张量
+        noisy_tensor = torch.from_numpy(noisy_patch)
+        clean_tensor = torch.from_numpy(clean_patch)
+        
+        return noisy_tensor, clean_tensor
+
+# -------------------------- 数据加载器封装（强制num_workers=0） --------------------------
+def get_sidd(data_dir, batch_size=16, patch_size=128):
+    dataset = SIDD_Raw_Dataset_Preloaded(data_dir, patch_size=patch_size)
+    # Windows系统强制num_workers=0
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=0,  #Windows下不要改大于0的数
+        pin_memory=True,	#内存锁定
+        drop_last=False
+    )
+
+# -------------------------- 训练主函数 --------------------------
+def main():
+    torch.manual_seed(168)
+    np.random.seed(168)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = True
+   
+    device = torch.device('cuda:0')
+    torch.cuda.set_device(device)
+    
+    data_dir = r'D:\SIDD_Medium_Raw\Data'
+
+    # -------------------------- 超参数设置（完全适配num_workers=0） --------------------------
+    batch_size = 16
+    patch_size = 128
+    epochs = 60
+
+    lr = 1e-3
+    step_size = 5
+    gamma = 0.5
+
+    # 加载数据集
+    try:
+        train_loader = get_sidd(data_dir, batch_size=batch_size, patch_size=patch_size)
+        print(f"数据集总迭代批次：{len(train_loader)}")
+    except Exception as e:
+        print(f"数据加载失败：{e}")
+        return
+    
+    # 初始化模型、优化器、损失函数
+    model = DnCNN().to(device)
+    print(f"模型已加载到GPU：{next(model.parameters()).device}")
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    criterion = nn.MSELoss().to(device)
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=step_size, gamma=gamma)
+    
+    # 训练循环
+    print("\n==================== 开始训练 ====================")
+    model.train()
+    for epoch in range(epochs):
+        total_loss = 0.0
+        # 本轮GPU计时
+        if torch.cuda.is_available():
+            start_time = torch.cuda.Event(enable_timing=True)
+            end_time = torch.cuda.Event(enable_timing=True)
+            start_time.record()
+        
+        for batch_idx, (noisy_imgs, clean_imgs) in enumerate(train_loader):
+            # 数据迁移到GPU，开启异步拷贝
+            noisy_imgs = noisy_imgs.to(device, non_blocking=True)
+            clean_imgs = clean_imgs.to(device, non_blocking=True)
+            
+            # 前向传播
+            pred_clean = model(noisy_imgs)
+            loss = criterion(pred_clean, clean_imgs)
+            
+            # 反向传播与参数更新
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            
+            # 累计损失
+            total_loss += loss.item()
+            
+            # 每5个batch打印一次进度
+            if batch_idx % 5 == 0:
+                gpu_mem = torch.cuda.memory_allocated(device)/1024**2 if torch.cuda.is_available() else 0
+                print(f"Epoch [{epoch+1}/{epochs}] | Batch [{batch_idx}/{len(train_loader)}] | Loss: {loss.item():.6f} | GPU显存：{gpu_mem:.1f} MB")
+        
+        epoch_time = 0.0
+        end_time.record()
+        torch.cuda.synchronize()
+        epoch_time = start_time.elapsed_time(end_time) / 1000
+        
+        # 学习率更新
+        scheduler.step()
+        # 打印每轮结果
+        avg_loss = total_loss / len(train_loader)
+        current_lr = optimizer.param_groups[0]['lr']
+        print(f"\nEpoch [{epoch+1}/{epochs}] 完成 | 耗时：{epoch_time:.2f}秒 | 平均Loss: {avg_loss:.6f} | 当前LR: {current_lr:.6f}\n")
+    
+    # 保存训练完成的模型
+    torch.save(model.state_dict(), "dncnn_sidd_raw_final.pth")
+    print("==================== 训练全部完成！模型已保存为 dncnn_sidd_raw_final.pth ====================")
+
+if __name__ == "__main__":
+    main()
